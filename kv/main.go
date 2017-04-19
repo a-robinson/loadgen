@@ -46,7 +46,7 @@ import (
 	_ "github.com/lib/pq"
 )
 
-var readPercent = flag.Int("read-percent", 0, "Percent of operations that are reads")
+var readPercent = flag.Int("read-percent", 50, "Percent of operations that are reads")
 
 // concurrency = number of concurrent insertion processes.
 var concurrency = flag.Int("concurrency", 2*runtime.NumCPU(), "Number of concurrent writers inserting blocks")
@@ -58,7 +58,7 @@ var splits = flag.Int("splits", 0, "Number of splits to perform before starting 
 
 var tolerateErrors = flag.Bool("tolerate-errors", false, "Keep running on error")
 
-var maxRate = flag.Float64("max-rate", 0, "Maximum frequency of operations (reads/writes). If 0, no limit.")
+var maxRate = flag.Float64("max-rate", 500, "Maximum frequency of operations (reads/writes). If 0, no limit.")
 
 // outputInterval = interval at which information is output to console.
 var outputInterval = flag.Duration("output-interval", 1*time.Second, "Interval of output")
@@ -265,7 +265,21 @@ func setupCockroach(parsedURL *url.URL) (database, error) {
 	if dbErr != nil {
 		return nil, dbErr
 	}
-	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS test"); err != nil {
+	pingErr := db.Ping()
+	if pingErr != nil {
+		for i := 0; i < 12; i++ {
+			log.Printf("error connecting to database (will retry): %v", pingErr)
+			time.Sleep(5 * time.Second)
+			pingErr = db.Ping()
+			if pingErr == nil {
+				break
+			}
+		}
+		if pingErr != nil {
+			return nil, pingErr
+		}
+	}
+	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS interop"); err != nil {
 		return nil, err
 	}
 
@@ -274,13 +288,13 @@ func setupCockroach(parsedURL *url.URL) (database, error) {
 	db.SetMaxIdleConns(*concurrency + 1)
 
 	if *drop {
-		if _, err := db.Exec(`DROP TABLE IF EXISTS test.kv`); err != nil {
+		if _, err := db.Exec(`DROP TABLE IF EXISTS interop.demo`); err != nil {
 			return nil, err
 		}
 	}
 
 	if _, err := db.Exec(`
-	CREATE TABLE IF NOT EXISTS test.kv (
+	CREATE TABLE IF NOT EXISTS interop.demo (
 	  k BIGINT NOT NULL PRIMARY KEY,
 	  v BYTES NOT NULL
 	)`); err != nil {
@@ -291,19 +305,19 @@ func setupCockroach(parsedURL *url.URL) (database, error) {
 		r := rand.New(rand.NewSource(int64(time.Now().UnixNano())))
 		g := newGenerator(&sequence{val: *writeSeq, seed: *seqSeed})
 		for i := 0; i < *splits; i++ {
-			if _, err := db.Exec(`ALTER TABLE test.kv SPLIT AT VALUES ($1)`, g.hash(r.Int63())); err != nil {
+			if _, err := db.Exec(`ALTER TABLE interop.demo SPLIT AT VALUES ($1)`, g.hash(r.Int63())); err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	readStmt, err := db.Prepare(`SELECT k, v FROM test.kv WHERE k = $1`)
+	readStmt, err := db.Prepare(`SELECT k, v FROM interop.demo WHERE k = $1`)
 	if err != nil {
 		return nil, err
 	}
 
 	var buf bytes.Buffer
-	buf.WriteString(`UPSERT INTO test.kv (k, v) VALUES`)
+	buf.WriteString(`UPSERT INTO interop.demo (k, v) VALUES`)
 
 	for i := 0; i < *batch; i++ {
 		j := i * 2
@@ -327,7 +341,7 @@ type mongoBlock struct {
 }
 
 type mongo struct {
-	kv *mgo.Collection
+	demo *mgo.Collection
 }
 
 func (m *mongo) read(key int64) error {
@@ -335,8 +349,8 @@ func (m *mongo) read(key int64) error {
 	// These queries are functionally the same, but the one using the $eq
 	// operator is ~30% slower!
 	//
-	// if err := m.kv.Find(bson.M{"_id": bson.M{"$eq": key}}).One(&b); err != nil {
-	if err := m.kv.Find(bson.M{"_id": key}).One(&b); err != nil {
+	// if err := m.demo.Find(bson.M{"_id": bson.M{"$eq": key}}).One(&b); err != nil {
+	if err := m.demo.Find(bson.M{"_id": key}).One(&b); err != nil {
 		if err == mgo.ErrNotFound {
 			return nil
 		}
@@ -354,13 +368,13 @@ func (m *mongo) write(count int, g *generator) error {
 		}
 	}
 
-	return m.kv.Insert(docs...)
+	return m.demo.Insert(docs...)
 }
 
 func (m *mongo) clone() database {
 	return &mongo{
 		// NB: Whoa!
-		kv: m.kv.Database.Session.Copy().DB(m.kv.Database.Name).C(m.kv.Name),
+		demo: m.demo.Database.Session.Copy().DB(m.demo.Database.Name).C(m.demo.Name),
 	}
 }
 
@@ -373,13 +387,13 @@ func setupMongo(parsedURL *url.URL) (database, error) {
 	session.SetMode(mgo.Monotonic, true)
 	session.SetSafe(&mgo.Safe{WMode: *mongoWMode, J: *mongoJ})
 
-	kv := session.DB("test").C("kv")
+	demo := session.DB("interop").C("demo")
 	if *drop {
 		// Intentionally ignore the error as we can't tell if the collection
 		// doesn't exist.
-		_ = kv.DropCollection()
+		_ = demo.DropCollection()
 	}
-	return &mongo{kv: kv}, nil
+	return &mongo{demo: demo}, nil
 }
 
 type cassandra struct {
@@ -389,7 +403,7 @@ type cassandra struct {
 func (c *cassandra) read(key int64) error {
 	var v []byte
 	if err := c.session.Query(
-		`SELECT v FROM test.kv WHERE k = ? LIMIT 1`,
+		`SELECT v FROM interop.demo WHERE k = ? LIMIT 1`,
 		key).Consistency(gocql.One).Scan(&v); err != nil {
 		if err == gocql.ErrNotFound {
 			return nil
@@ -400,7 +414,7 @@ func (c *cassandra) read(key int64) error {
 }
 
 func (c *cassandra) write(count int, g *generator) error {
-	const insertBlockStmt = "INSERT INTO test.kv (k, v) VALUES (?, ?); "
+	const insertBlockStmt = "INSERT INTO interop.demo (k, v) VALUES (?, ?); "
 
 	var buf bytes.Buffer
 	buf.WriteString("BEGIN BATCH ")
@@ -431,17 +445,17 @@ func setupCassandra(parsedURL *url.URL) (database, error) {
 	}
 
 	if *drop {
-		_ = s.Query(`DROP KEYSPACE test`).RetryPolicy(nil).Exec()
+		_ = s.Query(`DROP KEYSPACE interop`).RetryPolicy(nil).Exec()
 	}
 
 	createKeyspace := fmt.Sprintf(`
-CREATE KEYSPACE IF NOT EXISTS test WITH REPLICATION = {
+CREATE KEYSPACE IF NOT EXISTS interop WITH REPLICATION = {
   'class' : 'SimpleStrategy',
   'replication_factor' : %d
 };`, *cassandraReplication)
 
 	const createTable = `
-CREATE TABLE IF NOT EXISTS test.kv(
+CREATE TABLE IF NOT EXISTS interop.demo(
   k BIGINT,
   v BLOB,
   PRIMARY KEY(k)
@@ -464,7 +478,7 @@ func setupDatabase(dbURL string) (database, error) {
 	if err != nil {
 		return nil, err
 	}
-	parsedURL.Path = "test"
+	parsedURL.Path = "interop"
 
 	switch parsedURL.Scheme {
 	case "postgres", "postgresql":
@@ -488,7 +502,7 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	dbURL := "postgres://root@localhost:26257/photos?sslmode=disable"
+	dbURL := "postgres://root@localhost:26257/interop?sslmode=disable"
 	if flag.NArg() == 1 {
 		dbURL = flag.Arg(0)
 	}

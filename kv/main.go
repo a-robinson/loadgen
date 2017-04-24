@@ -267,7 +267,7 @@ func setupCockroach(parsedURL *url.URL) (database, error) {
 	}
 	pingErr := db.Ping()
 	if pingErr != nil {
-		for i := 0; i < 12; i++ {
+		for i := 0; i < 60; i++ {
 			log.Printf("error connecting to database (will retry): %v", pingErr)
 			time.Sleep(5 * time.Second)
 			pingErr = db.Ping()
